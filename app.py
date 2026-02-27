@@ -1,179 +1,200 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+import warnings
+from datetime import datetime
 
-# 1. 頁面初始化與樣式美化
-st.set_page_config(page_title="台股深度分析終端", page_icon="📈", layout="wide")
+# 基礎設定
+warnings.filterwarnings('ignore')
+st.set_page_config(page_title="正2槓桿再平衡回測系統", page_icon="⚖️", layout="wide")
 
+# 自定義 CSS 美化
 st.markdown("""
     <style>
-    .stApp { background-color: #0c0c0e; color: #e1e1e1; }
-    div[data-testid="stMetricValue"] { font-size: 28px; font-weight: bold; color: #58a6ff; }
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { 
-        height: 50px; 
-        background-color: #161b22; 
-        border-radius: 10px 10px 0 0; 
-        padding: 0 20px;
-        color: #8b949e;
-    }
-    .stTabs [aria-selected="true"] { background-color: #1f6feb !important; color: white !important; }
+    .main { background-color: #0e1117; }
+    .stMetric { background-color: #1a1c24; padding: 15px; border-radius: 12px; border: 1px solid #30363d; }
+    div[data-testid="stExpander"] { border: none; background-color: #161b22; }
     </style>
 """, unsafe_allow_html=True)
 
-# 2. 側邊欄控制台
+# --- 側邊欄控制 ---
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2422/2422796.png", width=80)
-    st.header("🔍 分析設定")
-    stock_id = st.text_input("輸入台股代碼 (例如: 2330, 2454)", value="2330")
+    st.header("🧪 策略參數")
     
-    # 自動補完代碼字尾
-    if ".TW" not in stock_id.upper() and ".TWO" not in stock_id.upper():
-        full_symbol = f"{stock_id}.TW"
-    else:
-        full_symbol = stock_id.upper()
-
-    lookback = st.selectbox("分析週期", ["1個月", "3個月", "6個月", "1年", "2年", "5年"], index=3)
-    period_map = {"1個月": "1mo", "3個月": "3mo", "6個月": "6mo", "1年": "1y", "2年": "2y", "5年": "5y"}
+    # 日期選擇
+    col_a, col_b = st.columns(2)
+    with col_a:
+        start_date = st.date_input("開始日期", value=datetime(2015, 1, 1))
+    with col_b:
+        end_date = st.date_input("結束日期", value=datetime.today())
+    
+    # 資金與比例
+    init_cash = st.number_input("初始資金 (TWD)", min_value=10000, value=1000000, step=100000)
+    target_ratio = st.slider("目標股票比例 (槓桿部位 %)", 10, 90, 50) / 100
+    trigger_threshold = st.slider("再平衡觸發閾值 (%)", 5, 100, 10) / 100
     
     st.divider()
-    st.markdown("### 🛠️ 指標快選")
-    show_ma = st.checkbox("移動平均線 (MA)", value=True)
-    show_rsi = st.checkbox("強弱指標 (RSI)", value=True)
-    show_macd = st.checkbox("平滑異同平均線 (MACD)", value=False)
+    st.markdown("### 💸 交易成本設定")
+    fee_rate = 0.001425  # 手續費
+    tax_rate = 0.003     # 交易稅 (賣出時)
     
-    run_btn = st.button("🚀 開始深度分析", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 執行完整回測", type="primary", use_container_width=True)
 
-# 3. 數據獲取與處理
-@st.cache_data(show_spinner=False, ttl=600)
-def fetch_stock_data(symbol, period):
+st.title("⚖️ 槓桿 ETF 搭配再平衡回測系統")
+st.caption("研究對象：00631L (元大台灣50正2) vs 0050 (元大台灣50)")
+
+# --- 核心邏輯 ---
+@st.cache_data(show_spinner=False)
+def get_data(start, end):
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period)
-        if df.empty:
-            # 嘗試切換代碼後綴 (有些股在 .TWO 上櫃)
-            alt_symbol = symbol.replace(".TW", ".TWO") if ".TW" in symbol else symbol.replace(".TWO", ".TW")
-            df = yf.Ticker(alt_symbol).history(period=period)
-            if not df.empty: symbol = alt_symbol
+        # 下載數據
+        df_lev = yf.download('00631L.TW', start=start, end=end, auto_adjust=True, progress=False)
+        df_bm = yf.download('0050.TW', start=start, end=end, auto_adjust=True, progress=False)
         
-        info = ticker.info
-        return df, info, symbol
+        if df_lev.empty or df_bm.empty: return None, None
+        
+        # 處理 yfinance 可能的 MultiIndex
+        s_lev = df_lev['Close'].iloc[:, 0] if isinstance(df_lev.columns, pd.MultiIndex) else df_lev['Close']
+        s_bm = df_bm['Close'].iloc[:, 0] if isinstance(df_bm.columns, pd.MultiIndex) else df_bm['Close']
+        
+        common_idx = s_lev.index.intersection(s_bm.index)
+        return s_lev.loc[common_idx].dropna(), s_bm.loc[common_idx].dropna()
     except Exception as e:
-        return None, None, symbol
+        st.error(f"數據下載失敗: {e}")
+        return None, None
 
-# 4. 圖表渲染函數
-def draw_pro_chart(df, symbol, show_rsi, show_macd):
-    # 計算指標
-    df['MA5'] = ta.sma(df['Close'], length=5)
-    df['MA20'] = ta.sma(df['Close'], length=20)
-    df['MA60'] = ta.sma(df['Close'], length=60)
+def run_backtest(prices, init_total, target_ratio, trigger):
+    cash = init_total * (1 - target_ratio)
+    price_init = float(prices.iloc[0])
+    shares = (init_total * target_ratio * (1 - fee_rate)) / price_init
     
-    rows = 2
-    heights = [0.7, 0.3]
-    if show_rsi and show_macd:
-        rows = 3
-        heights = [0.5, 0.25, 0.25]
-    elif show_rsi or show_macd:
-        rows = 2
-        heights = [0.7, 0.3]
+    history = []
+    log = []
+    
+    for date, price in prices.items():
+        price = float(price)
+        stock_val = shares * price
+        total_val = stock_val + cash
+        current_ratio = stock_val / total_val
+        
+        # 檢查是否需要再平衡 (相對於目標比例的偏離度)
+        deviation = abs(current_ratio - target_ratio) / target_ratio
+        
+        if deviation >= trigger and date != prices.index[0]:
+            target_stock_val = total_val * target_ratio
+            diff = target_stock_val - stock_val
+            
+            if diff > 0: # 買入加碼
+                cost = diff / (1 - fee_rate)
+                if cash >= cost:
+                    shares_to_buy = diff / price * (1 - fee_rate)
+                    shares += shares_to_buy
+                    cash -= cost
+                    log.append({"日期": date, "動作": "再平衡買入", "金額": round(diff), "目前比例": f"{current_ratio:.1%}"})
+            else: # 賣出獲利
+                shares_to_sell = abs(diff) / price
+                revenue = abs(diff) * (1 - fee_rate - tax_rate)
+                shares -= shares_to_sell
+                cash += revenue
+                log.append({"日期": date, "動作": "再平衡賣出", "金額": round(abs(diff)), "目前比例": f"{current_ratio:.1%}"})
+        
+        history.append({
+            "Date": date,
+            "Total": shares * price + cash,
+            "StockValue": shares * price,
+            "Cash": cash,
+            "Ratio": (shares * price) / (shares * price + cash)
+        })
+        
+    return pd.DataFrame(history).set_index("Date"), pd.DataFrame(log)
+
+# --- 畫面呈現 ---
+if run_btn:
+    with st.spinner("正在獲取台股歷史數據..."):
+        s_lev, s_bm = get_data(start_date, end_date)
+        
+    if s_lev is not None:
+        # 1. 執行回測
+        res_strat, res_log = run_backtest(s_lev, init_cash, target_ratio, trigger_threshold)
+        
+        # 2. 計算對照組 (0050 買入持有)
+        bm_shares = (init_cash * (1 - fee_rate)) / s_bm.iloc[0]
+        res_bm = (s_bm * bm_shares).to_frame(name="Total")
+        
+        # 3. 績效統計
+        def get_stats(df, initial):
+            final = df['Total'].iloc[-1]
+            ret = (final / initial - 1) * 100
+            years = (df.index[-1] - df.index[0]).days / 365
+            cagr = ((final / initial) ** (1/max(years, 0.1)) - 1) * 100
+            mdd = ((df['Total'].cummax() - df['Total']) / df['Total'].cummax()).max() * 100
+            return final, ret, cagr, mdd
+
+        f1, r1, c1, d1 = get_stats(res_strat, init_cash)
+        f2, r2, c2, d2 = get_stats(res_bm, init_cash)
+
+        # 4. 數據看板
+        st.subheader("📊 績效指標比較")
+        c_a, c_b = st.columns(2)
+        with c_a:
+            st.info(f"### 槓桿再平衡策略")
+            m1, m2 = st.columns(2); m1.metric("最終資產", f"${f1:,.0f}"); m2.metric("總報酬", f"{r1:+.1f}%")
+            m3, m4 = st.columns(2); m3.metric("年化報酬", f"{c1:.1f}%"); m4.metric("最大回撤", f"-{d1:.1f}%")
+        with c_b:
+            st.info(f"### 0050 買入持有")
+            m1, m2 = st.columns(2); m1.metric("最終資產", f"${f2:,.0f}"); m2.metric("總報酬", f"{r2:+.1f}%")
+            m3, m4 = st.columns(2); m3.metric("年化報酬", f"{c2:.1f}%"); m4.metric("最大回撤", f"-{d2:.1f}%")
+
+        st.divider()
+
+        # 5. Plotly 互動圖表
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                            subplot_titles=("📈 淨值成長曲線 (萬元)", "⚖️ 策略倉位比例變動 (%)", "📉 回撤深度比較 (%)"),
+                            row_heights=[0.5, 0.25, 0.25])
+        
+        # 淨值線
+        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Total']/10000, name="槓桿策略", line=dict(color='#ff4b4b', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=res_bm.index, y=res_bm['Total']/10000, name="0050 買入持有", line=dict(color='#00d4ff', width=1.5, dash='dot')), row=1, col=1)
+        
+        # 再平衡標記
+        if not res_log.empty:
+            buys = res_log[res_log['動作'] == '再平衡買入']
+            sells = res_log[res_log['動作'] == '再平衡賣出']
+            fig.add_trace(go.Scatter(x=buys['日期'], y=res_strat.loc[buys['日期'], 'Total']/10000, mode='markers', name='再平衡買點', marker=dict(symbol='triangle-up', color='#00ff88', size=10)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=sells['日期'], y=res_strat.loc[sells['日期'], 'Total']/10000, mode='markers', name='再平衡賣點', marker=dict(symbol='triangle-down', color='#f1c40f', size=10)), row=1, col=1)
+
+        # 比例變動
+        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Ratio']*100, name="實際股票比例", fill='tozeroy', line=dict(color='rgba(255, 75, 75, 0.3)')), row=2, col=1)
+        fig.add_hline(y=target_ratio*100, line_dash="dash", line_color="white", row=2, col=1)
+
+        # 回撤線
+        dd_strat = (res_strat['Total'] / res_strat['Total'].cummax() - 1) * 100
+        dd_bm = (res_bm['Total'] / res_bm['Total'].cummax() - 1) * 100
+        fig.add_trace(go.Scatter(x=res_strat.index, y=dd_strat, name="策略回撤", fill='tozeroy', line=dict(color='#ff4b4b')), row=3, col=1)
+        fig.add_trace(go.Scatter(x=res_bm.index, y=dd_bm, name="0050 回撤", fill='tozeroy', line=dict(color='#00d4ff')), row=3, col=1)
+
+        fig.update_layout(height=1000, template="plotly_dark", hovermode="x unified",
+                          margin=dict(l=50, r=50, t=80, b=50), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 6. 詳細明細
+        if not res_log.empty:
+            with st.expander(f"📋 查看再平衡歷史明細 (共 {len(res_log)} 次交易)"):
+                st.dataframe(res_log, use_container_width=True)
     else:
-        rows = 1
-        heights = [1.0]
-
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, 
-                        vertical_spacing=0.03, row_heights=heights)
-
-    # 主圖: K線與均線
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], 
-                                 low=df['Low'], close=df['Close'], name="K線"), row=1, col=1)
-    if show_ma:
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], name="MA5", line=dict(color='#FFD700', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name="MA20", line=dict(color='#00BFFF', width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name="MA60", line=dict(color='#FF00FF', width=1)), row=1, col=1)
-
-    # RSI 子圖
-    curr_row = 2
-    if show_rsi:
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], name="RSI", line=dict(color='#00FF7F')), row=curr_row, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=curr_row, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=curr_row, col=1)
-        curr_row += 1
-
-    # MACD 子圖
-    if show_macd:
-        macd = ta.macd(df['Close'])
-        fig.add_trace(go.Bar(x=df.index, y=macd['MACDh_12_26_9'], name="MACD Histogram"), row=curr_row, col=1)
-        curr_row += 1
-
-    fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False,
-                      margin=dict(l=50, r=50, t=50, b=50), legend=dict(orientation="h", y=1.02))
-    return fig
-
-# 5. 主程式畫面
-if run_btn or stock_id:
-    with st.spinner(f"正在連線市場抓取 {full_symbol} 資料..."):
-        df, info, actual_symbol = fetch_stock_data(full_symbol, period_map[lookback])
-
-    if df is not None and not df.empty:
-        # 顯示頭部資訊
-        curr_p = df['Close'].iloc[-1]
-        prev_p = df['Close'].iloc[-2]
-        change = curr_p - prev_p
-        pct = (change / prev_p) * 100
-        
-        st.subheader(f"📊 {info.get('longName', actual_symbol)} ({actual_symbol})")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("目前股價", f"{curr_p:,.2f}", f"{change:+.2f} ({pct:+.2f}%)")
-        c2.metric("最高/最低 (區間)", f"{df['High'].max():,.0f} / {df['Low'].min():,.0f}")
-        c3.metric("本益比 (PE)", f"{info.get('trailingPE', 'N/A')}")
-        c4.metric("市值", f"{info.get('marketCap', 0)/1e8:,.0f} 億")
-
-        tab_main, tab_fin, tab_news = st.tabs(["📈 圖表分析", "📂 財務績效", "📰 相關數據"])
-        
-        with tab_main:
-            st.plotly_chart(draw_pro_chart(df, actual_symbol, show_rsi, show_macd), use_container_width=True)
-            
-        with tab_fin:
-            st.markdown("### 近年財務關鍵數據")
-            col_f1, col_f2 = st.columns(2)
-            with col_f1:
-                st.write("**每股盈餘 (EPS)**")
-                st.info(f"最新 EPS: {info.get('trailingEps', '資料載入中...')}")
-            with col_f2:
-                st.write("**股息殖利率**")
-                yield_val = info.get('dividendYield', 0)
-                st.info(f"{yield_val*100:.2f} %" if yield_val else "未發放股利")
-            
-            st.markdown("---")
-            st.markdown("### 業務摘要")
-            st.write(info.get('longBusinessSummary', '尚無中文介紹'))
-
-        with tab_news:
-            st.success("🤖 AI 自動分析建議")
-            if df['Close'].iloc[-1] > df['MA20'].iloc[-1]:
-                st.markdown("- **技術面**：目前股價位於月線之上，屬於多頭排列。")
-            else:
-                st.markdown("- **技術面**：股價跌破月線，建議保守觀察支撐點。")
-            
-            if show_rsi:
-                rsi_val = df['RSI'].iloc[-1]
-                if rsi_val > 70: st.markdown("- **動能**：RSI 進入超買區，需留意回檔。")
-                elif rsi_val < 30: st.markdown("- **動能**：RSI 進入超跌區，反彈機會大。")
-
-    else:
-        st.error(f"❌ 無法取得代碼 {full_symbol} 的資料。")
-        st.markdown("""
-        **可能原因：**
-        1. 網路上暫時無法連線至 Yahoo Finance。
-        2. 台股代碼輸入錯誤（應為四位數字，如 2330）。
-        3. 該股票已退市或更改名稱。
-        """)
+        st.error("無法取得數據，請確認代碼 00631L.TW 及 0050.TW 於該日期範圍內有交易資料。")
 else:
-    st.info("請在左側輸入台股代碼並按分析開始。本系統採用 Plotly 渲染，100% 解決中文亂碼問題。")
+    st.info("👈 請在左側設定參數後點擊「執行完整回測」。")
+    st.markdown("""
+    ### 📖 策略原理說明
+    1. **本尊與分身**：持有 50% 的「0050正2」加上 50% 的「現金」，在理論上與持有 100% 的 0050 有相似的市場曝險（100%）。
+    2. **再平衡紅利**：
+       - 當股市大漲，正2部位增值，比例會超過 50%。此時「再平衡」會**賣高**，將獲利轉為現金。
+       - 當股市大跌，正2部位縮水，比例會低於 50%。此時「再平衡」會**買低**，用現金加碼正2。
+    3. **波動率勝出**：在長期波動向上的市場，這種「自動低買高賣」的機制往往能創造比單純持有 0050 更高的年化報酬，同時保留現金緩衝。
+    """)
 
