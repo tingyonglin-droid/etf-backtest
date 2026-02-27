@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
-warnings.filterwarnings(‘ignore’)
+warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title=‘槓桿ETF回測系統’, page_icon=‘📈’, layout=‘wide’)
 st.title(‘📈 槓桿ETF回測系統’)
