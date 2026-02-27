@@ -9,20 +9,19 @@ from datetime import datetime
 
 # 基礎設定
 warnings.filterwarnings('ignore')
-st.set_page_config(page_title="正2槓桿再平衡回測系統 Pro", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="正2價格變動再平衡回測", page_icon="⚖️", layout="wide")
 
-# 自定義 CSS 美化
+# 自定義 CSS
 st.markdown("""
     <style>
     .main { background-color: #0c0c0e; }
     .stMetric { background-color: #161b22; padding: 20px; border-radius: 15px; border: 1px solid #30363d; }
-    div[data-testid="stExpander"] { border: 1px solid #30363d; background-color: #161b22; }
     </style>
 """, unsafe_allow_html=True)
 
 # --- 側邊欄控制 ---
 with st.sidebar:
-    st.header("🧪 策略參數")
+    st.header("🧪 價格策略參數")
     
     col_a, col_b = st.columns(2)
     with col_a:
@@ -30,25 +29,21 @@ with st.sidebar:
     with col_b:
         end_date = st.date_input("結束日期", value=datetime.today())
     
-    init_cash = st.number_input("初始資金 (TWD)", min_value=10000, value=1000000, step=100000)
-    target_ratio = st.slider("目標股票比例 (槓桿部位 %)", 10, 90, 50) / 100
+    init_cash = st.number_input("初始總資產 (TWD)", min_value=10000, value=1000000, step=100000)
+    target_ratio = st.slider("目標股票比例 (%)", 10, 90, 50) / 100
     
-    # 修改觸發邏輯描述，讓使用者更明白
-    trigger_type = st.radio("觸發模式", ["絕對百分比偏移 (推薦)", "相對比例偏移"])
-    if trigger_type == "絕對百分比偏移 (推薦)":
-        abs_threshold = st.slider("比例偏離目標幾 % 時觸發？", 1, 20, 5) / 100
-    else:
-        rel_threshold = st.slider("相對偏移百分比 (舊版邏輯 %)", 10, 100, 20) / 100
+    # 這裡改成使用者要求的「價格漲跌幅」觸發
+    price_trigger = st.slider("股價漲跌幅達多少 % 時再平衡？", 10, 100, 50) / 100
 
     st.divider()
-    st.markdown("### 💸 交易成本設定")
+    st.markdown("### 💸 交易成本")
     fee_rate = 0.001425  
     tax_rate = 0.003     
     
-    run_btn = st.button("🚀 執行診斷回測", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 執行價格回測", type="primary", use_container_width=True)
 
-st.title("⚖️ 槓桿 ETF 搭配再平衡回測系統 Pro")
-st.caption("透過數據診斷：為什麼 2022 年沒有觸發再平衡？")
+st.title("⚖️ 槓桿 ETF 價格再平衡系統")
+st.caption(f"策略邏輯：當 00631L 股價相對於前次再平衡價格漲跌達 {price_trigger*100:.0f}% 時，重新配置至 {target_ratio*100:.0f}% 股票。")
 
 # --- 數據抓取 ---
 @st.cache_data(show_spinner=False)
@@ -64,122 +59,113 @@ def get_data(start, end):
     except Exception:
         return None, None
 
-# --- 回測核心邏輯 ---
-def run_backtest(prices, init_total, target_ratio, trigger_val, is_absolute):
+# --- 回測核心邏輯 (股價觸發版) ---
+def run_price_backtest(prices, init_total, target_ratio, price_trigger):
     cash = init_total * (1 - target_ratio)
-    price_init = float(prices.iloc[0])
-    shares = (init_total * target_ratio * (1 - fee_rate)) / price_init
+    last_price = float(prices.iloc[0]) # 基準價格
+    shares = (init_total * target_ratio * (1 - fee_rate)) / last_price
     
     history = []
     log = []
-    
-    # 計算邊界線供圖表顯示
-    if is_absolute:
-        upper_limit = (target_ratio + trigger_val) * 100
-        lower_limit = (target_ratio - trigger_val) * 100
-    else:
-        upper_limit = target_ratio * (1 + trigger_val) * 100
-        lower_limit = target_ratio * (1 - trigger_val) * 100
 
     for date, price in prices.items():
         price = float(price)
         stock_val = shares * price
         total_val = stock_val + cash
-        current_ratio = stock_val / total_val
         
-        # 判斷觸發
-        trigger_hit = False
-        if is_absolute:
-            if abs(current_ratio - target_ratio) >= trigger_val:
-                trigger_hit = True
-        else:
-            if (abs(current_ratio - target_ratio) / target_ratio) >= trigger_val:
-                trigger_hit = True
-
-        if trigger_hit and date != prices.index[0]:
+        # 計算相對於上次再平衡的價格漲跌幅
+        price_change = (price - last_price) / last_price
+        
+        # 觸發判斷：漲跌超過設定閾值
+        if abs(price_change) >= price_trigger and date != prices.index[0]:
+            # 執行再平衡：將總價值重新按目標比例分配
             target_stock_val = total_val * target_ratio
             diff = target_stock_val - stock_val
             
-            if diff > 0: # 買入加碼
-                cost = diff / (1 - fee_rate)
-                if cash >= cost:
-                    shares += (diff / price * (1 - fee_rate))
-                    cash -= cost
-                    log.append({"日期": date, "動作": "再平衡買入", "金額": round(diff), "Equity": total_val})
-            else: # 賣出獲利
+            action_type = "再平衡買入" if diff > 0 else "再平衡賣出"
+            
+            if diff > 0: # 加碼
+                shares += (diff / price * (1 - fee_rate))
+                cash -= (diff / (1 - fee_rate))
+            else: # 獲利了結
                 shares -= (abs(diff) / price)
                 cash += (abs(diff) * (1 - fee_rate - tax_rate))
-                log.append({"日期": date, "動作": "再平衡賣出", "金額": round(abs(diff)), "Equity": total_val})
+            
+            log.append({
+                "日期": date, 
+                "動作": action_type, 
+                "標的價格": round(price, 2), 
+                "基準變動": f"{price_change:+.1%}",
+                "Equity": total_val
+            })
+            
+            # 更新基準價格為當前價格
+            last_price = price
         
         history.append({
             "Date": date,
             "Total": shares * price + cash,
-            "Ratio": current_ratio * 100
+            "StockValue": shares * price,
+            "Price": price,
+            "Ratio": (shares * price) / (shares * price + cash) * 100
         })
         
-    return pd.DataFrame(history).set_index("Date"), pd.DataFrame(log), upper_limit, lower_limit
+    return pd.DataFrame(history).set_index("Date"), pd.DataFrame(log)
 
 # --- 畫面渲染 ---
 if run_btn:
-    with st.spinner("計算中..."):
+    with st.spinner("回測計算中..."):
         s_lev, s_bm = get_data(start_date, end_date)
         
     if s_lev is not None:
-        # 執行回測
-        thresh = abs_threshold if trigger_type == "絕對百分比偏移 (推薦)" else rel_threshold
-        is_abs = (trigger_type == "絕對百分比偏移 (推薦)")
-        res_strat, res_log, up_line, low_line = run_backtest(s_lev, init_cash, target_ratio, thresh, is_abs)
+        res_strat, res_log = run_price_backtest(s_lev, init_cash, target_ratio, price_trigger)
         
-        # 0050 對照
+        # 對照組 0050
         bm_shares = (init_cash * (1 - fee_rate)) / s_bm.iloc[0]
         res_bm = (s_bm * bm_shares).to_frame(name="Total")
         
-        # 顯示績效
-        final_val = res_strat['Total'].iloc[-1]
-        st.subheader("📊 策略回測總結")
+        # 數據看板
+        st.subheader("📊 回測績效摘要")
         c1, c2, c3 = st.columns(3)
+        final_val = res_strat['Total'].iloc[-1]
         c1.metric("最終資產", f"${final_val:,.0f} 元")
         c2.metric("總報酬率", f"{(final_val/init_cash-1)*100:+.1f}%")
-        c3.metric("再平衡次數", f"{len(res_log)} 次")
+        c3.metric("再平衡交易次數", f"{len(res_log)} 次")
 
         st.divider()
 
         # --- Plotly 圖表 ---
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.1, 
-                            subplot_titles=("📈 淨值曲線與交易點", "⚖️ 比例變動 (包含觸發邊界)", "📉 回撤深度 (%)"),
+                            vertical_spacing=0.08, 
+                            subplot_titles=("📈 淨值曲線 (萬元) 與價格觸發點", "🏷️ 00631L 股價變動 (基準監控)", "⚖️ 資產比例變動 (%)"),
                             row_heights=[0.5, 0.25, 0.25])
         
         # 1. 淨值圖
-        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Total']/10000, name="策略淨值", line=dict(color='#ff4b4b', width=2.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Total']/10000, name="價格再平衡策略", line=dict(color='#ff4b4b', width=2.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=res_bm.index, y=res_bm['Total']/10000, name="0050 持有", line=dict(color='#00d4ff', width=1, dash='dot')), row=1, col=1)
+        
         if not res_log.empty:
             b = res_log[res_log['動作'] == '再平衡買入']
             s = res_log[res_log['動作'] == '再平衡賣出']
-            fig.add_trace(go.Scatter(x=b['日期'], y=b['Equity']/10000, mode='markers', name='買入加碼', marker=dict(symbol='triangle-up', color='#00ff88', size=12)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=s['日期'], y=s['Equity']/10000, mode='markers', name='賣出獲利', marker=dict(symbol='triangle-down', color='#f1c40f', size=12)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=b['日期'], y=b['Equity']/10000, mode='markers', name='低點加碼點', marker=dict(symbol='triangle-up', color='#00ff88', size=12)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=s['日期'], y=s['Equity']/10000, mode='markers', name='高點獲利點', marker=dict(symbol='triangle-down', color='#f1c40f', size=12)), row=1, col=1)
 
-        # 2. 比例圖 (包含診斷紅線)
-        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Ratio'], name="目前股票比例 %", fill='tozeroy', fillcolor='rgba(255, 75, 75, 0.1)', line=dict(color='#ff4b4b')), row=2, col=1)
-        fig.add_hline(y=target_ratio*100, line_dash="dash", line_color="white", row=2, col=1, annotation_text="目標")
-        # 觸發邊界線 (診斷為什麼 2022 沒動的原因)
-        fig.add_hline(y=up_line, line_dash="dot", line_color="red", opacity=0.5, row=2, col=1, annotation_text="賣出閾值")
-        fig.add_hline(y=low_line, line_dash="dot", line_color="green", opacity=0.5, row=2, col=1, annotation_text="買入閾值")
+        # 2. 標的價格圖 (用來觀察為什麼觸發)
+        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Price'], name="00631L 股價", line=dict(color='#ff9f43')), row=2, col=1)
 
-        # 3. 回撤圖
-        dd_strat = (res_strat['Total'] / res_strat['Total'].cummax() - 1) * 100
-        dd_bm = (res_bm['Total'] / res_bm['Total'].cummax() - 1) * 100
-        fig.add_trace(go.Scatter(x=res_strat.index, y=dd_strat, name="策略回撤", fill='tozeroy', line=dict(color='#ff4b4b', width=1)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=res_bm.index, y=dd_bm, name="0050 回撤", line=dict(color='#00d4ff', width=1)), row=3, col=1)
+        # 3. 比例圖
+        fig.add_trace(go.Scatter(x=res_strat.index, y=res_strat['Ratio'], name="股票佔比 %", fill='tozeroy', fillcolor='rgba(255, 75, 75, 0.1)', line=dict(color='#ff4b4b', width=1)), row=3, col=1)
+        fig.add_hline(y=target_ratio*100, line_dash="dash", line_color="white", row=3, col=1)
 
         fig.update_layout(height=1100, template="plotly_dark", hovermode="x unified", margin=dict(l=80, r=40, t=80, b=100))
-        fig.update_yaxes(range=[0, 100], ticksuffix="%", row=2, col=1)
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.warning(f"💡 **診斷提示：** 觀察中間那張圖。在 2022 年大跌時，股票比例（紅色區塊）是否有觸碰到底部的 **『買入閾值（綠色虛線）』**？如果沒有觸碰到，表示當時的跌幅還不足以讓比例偏移達到你設定的觸發門檻。")
+        fig.update_yaxes(ticksuffix="w", row=1, col=1)
+        fig.update_yaxes(range=[0, 100], ticksuffix="%", row=3, col=1)
 
+        st.plotly_chart(fig, use_container_width=True)
+
+        if not res_log.empty:
+            with st.expander("📋 查看詳細交易明細"):
+                st.dataframe(res_log, use_container_width=True)
     else:
-        st.error("下載失敗。")
-else:
-    st.info("👈 請點擊「執行診斷回測」開始。")
+        st.error("數據獲取失敗。")
 
