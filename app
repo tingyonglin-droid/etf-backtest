@@ -1,0 +1,302 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+warnings.filterwarnings(‘ignore’)
+
+st.set_page_config(page_title=‘槓桿ETF回測系統’, page_icon=‘📈’, layout=‘wide’)
+st.title(‘📈 槓桿ETF回測系統’)
+st.caption(‘策略：00631L（0050正2）+ 現金，定期再平衡 vs 0050買入持有’)
+
+# ============================================================
+
+# 側邊欄參數設定
+
+# ============================================================
+
+with st.sidebar:
+st.header(‘⚙️ 回測參數’)
+
+```
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input('開始日期', value=pd.to_datetime('2015-01-01'),
+                               min_value=pd.to_datetime('2014-10-31'))
+with col2:
+    end_date = st.date_input('結束日期', value=pd.to_datetime('2024-12-31'))
+
+init_cash = st.number_input('初始資金（元）', min_value=10000, max_value=100000000,
+                             value=1000000, step=100000, format='%d')
+
+stock_ratio = st.slider('股票配置比例（%）', min_value=10, max_value=90,
+                         value=50, step=5) / 100
+
+rebalance_trigger = st.slider('再平衡觸發偏移（%）', min_value=10, max_value=100,
+                               value=50, step=5) / 100
+
+commission = 0.001425
+tax = 0.003
+
+st.divider()
+st.caption(f'現金比例：{(1-stock_ratio)*100:.0f}%')
+st.caption(f'等效曝險：{stock_ratio*2*100:.0f}%（正2×{stock_ratio*100:.0f}%）')
+st.caption('手續費：0.1425%，交易稅：0.3%')
+
+run_btn = st.button('🚀 執行回測', type='primary', use_container_width=True)
+```
+
+# ============================================================
+
+# 回測函數
+
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def fetch_data(start, end):
+s_lev = yf.download(‘00631L.TW’, start=start, end=end, auto_adjust=True, progress=False)[‘Close’].squeeze()
+s_bm  = yf.download(‘0050.TW’,   start=start, end=end, auto_adjust=True, progress=False)[‘Close’].squeeze()
+idx   = s_lev.index.intersection(s_bm.index)
+return s_lev.loc[idx], s_bm.loc[idx]
+
+def run_strategy(prices, init_cash, stock_ratio, trigger, commission, tax):
+cash_ratio = 1 - stock_ratio
+cash       = init_cash * cash_ratio
+price0     = float(prices.iloc[0])
+shares     = (init_cash * stock_ratio) * (1 - commission) / price0
+cash      -= init_cash * stock_ratio
+
+```
+rebalances = []
+equity     = []
+
+for date, price in prices.items():
+    price       = float(price)
+    stock_val   = shares * price
+    total       = stock_val + cash
+    cur_ratio   = stock_val / total
+    deviation   = abs(cur_ratio - stock_ratio) / stock_ratio
+
+    if deviation >= trigger and date != prices.index[0]:
+        target = total * stock_ratio
+        diff   = target - stock_val
+        if diff > 0:
+            new_sh = diff / price * (1 - commission)
+            cost   = diff / (1 - commission)
+            if cash >= cost:
+                shares += new_sh
+                cash   -= cost
+                rebalances.append({'日期': date, '動作': '買入再平衡',
+                                   '價格': round(price, 2), '金額': round(diff, 0),
+                                   '觸發前股票比例': f'{cur_ratio:.1%}'})
+        else:
+            sell_sh = abs(diff) / price
+            revenue = sell_sh * price * (1 - commission - tax)
+            shares -= sell_sh
+            cash   += revenue
+            rebalances.append({'日期': date, '動作': '賣出再平衡',
+                               '價格': round(price, 2), '金額': round(abs(diff), 0),
+                               '觸發前股票比例': f'{cur_ratio:.1%}'})
+
+    equity.append({'date': date, 'value': shares * price + cash,
+                   'stock_value': shares * price, 'cash': cash})
+
+df = pd.DataFrame(equity).set_index('date')
+scale = init_cash / df['value'].iloc[0]
+df['value']       *= scale
+df['stock_value'] *= scale
+df['cash']        *= scale
+return df, pd.DataFrame(rebalances)
+```
+
+def run_buyhold(prices, init_cash, commission):
+shares = init_cash * (1 - commission) / float(prices.iloc[0])
+df = pd.DataFrame([{‘date’: d, ‘value’: shares * float(p)} for d, p in prices.items()]).set_index(‘date’)
+df[‘value’] = df[‘value’] / df[‘value’].iloc[0] * init_cash
+return df
+
+def calc_stats(eq, init_cash, name):
+final    = eq[‘value’].iloc[-1]
+ret      = (final - init_cash) / init_cash * 100
+years    = (eq.index[-1] - eq.index[0]).days / 365
+cagr     = ((final / init_cash) ** (1 / years) - 1) * 100
+roll_max = eq[‘value’].cummax()
+mdd      = ((roll_max - eq[‘value’]) / roll_max).max() * 100
+dr       = eq[‘value’].pct_change().dropna()
+sharpe   = (dr.mean() * 252 - 0.015) / (dr.std() * np.sqrt(252))
+return {‘策略’: name, ‘最終資產’: f’{final:,.0f} 元’,
+‘總報酬’: f’{ret:+.2f}%’, ‘年化報酬(CAGR)’: f’{cagr:+.2f}%’,
+‘最大回撤’: f’{mdd:.2f}%’, ‘Sharpe’: f’{sharpe:.2f}’}
+
+# ============================================================
+
+# 主畫面
+
+# ============================================================
+
+if run_btn:
+with st.spinner(‘下載資料中…’):
+try:
+s_lev, s_bm = fetch_data(str(start_date), str(end_date))
+except Exception as e:
+st.error(f’資料下載失敗：{e}’)
+st.stop()
+
+```
+if len(s_lev) < 10:
+    st.error('資料不足，請調整日期範圍')
+    st.stop()
+
+with st.spinner('回測計算中...'):
+    eq_lev, rebalance_df = run_strategy(s_lev, init_cash, stock_ratio,
+                                         rebalance_trigger, commission, tax)
+    eq_bm = run_buyhold(s_bm, init_cash, commission)
+
+# 績效指標
+s1 = calc_stats(eq_lev, init_cash, f'槓桿策略（正2 {stock_ratio*100:.0f}%+現金）')
+s2 = calc_stats(eq_bm,  init_cash, '0050 買入持有')
+
+st.subheader('📊 績效比較')
+col1, col2 = st.columns(2)
+
+def metric_card(col, stats, color):
+    with col:
+        st.markdown(f"**{stats['策略']}**")
+        m1, m2 = st.columns(2)
+        m1.metric('最終資產', stats['最終資產'])
+        m2.metric('總報酬',   stats['總報酬'])
+        m3, m4, m5 = st.columns(3)
+        m3.metric('年化報酬', stats['年化報酬(CAGR)'])
+        m4.metric('最大回撤', stats['最大回撤'])
+        m5.metric('Sharpe',   stats['Sharpe'])
+
+metric_card(col1, s1, '#e74c3c')
+metric_card(col2, s2, '#2980b9')
+
+st.divider()
+
+# 繪圖
+fig, axes = plt.subplots(4, 1, figsize=(12, 14),
+                          gridspec_kw={'height_ratios': [3, 1.5, 1.5, 1.5]})
+fig.patch.set_facecolor('#0e1117')
+for ax in axes:
+    ax.set_facecolor('#0e1117')
+    ax.tick_params(colors='white')
+    ax.yaxis.label.set_color('white')
+    ax.xaxis.label.set_color('white')
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#444')
+
+fig.suptitle('回測結果', fontsize=14, color='white', fontweight='bold')
+
+# 圖1：資產曲線
+ax1 = axes[0]
+ax1.plot(eq_lev.index, eq_lev['value']/10000, label=f'槓桿策略', color='#e74c3c', lw=2)
+ax1.plot(eq_bm.index,  eq_bm['value']/10000,  label='0050 買入持有', color='#3498db', lw=2)
+ax1.axhline(init_cash/10000, color='gray', lw=0.8, ls='--', label='初始資金')
+
+if not rebalance_df.empty:
+    sells = rebalance_df[rebalance_df['動作'] == '賣出再平衡']
+    buys  = rebalance_df[rebalance_df['動作'] == '買入再平衡']
+    for _, r in sells.iterrows():
+        if r['日期'] in eq_lev.index:
+            ax1.scatter(r['日期'], eq_lev.loc[r['日期'], 'value']/10000,
+                        color='#ff6b6b', s=50, zorder=5)
+    for _, r in buys.iterrows():
+        if r['日期'] in eq_lev.index:
+            ax1.scatter(r['日期'], eq_lev.loc[r['日期'], 'value']/10000,
+                        color='#2ecc71', s=50, zorder=5)
+
+from matplotlib.lines import Line2D
+h, l = ax1.get_legend_handles_labels()
+h += [Line2D([0],[0], marker='o', color='w', markerfacecolor='#ff6b6b', ms=8),
+      Line2D([0],[0], marker='o', color='w', markerfacecolor='#2ecc71', ms=8)]
+l += ['賣出再平衡', '買入再平衡']
+ax1.legend(handles=h, labels=l, fontsize=8, facecolor='#1a1a2e', labelcolor='white')
+ax1.set_ylabel('資產（萬元）')
+ax1.grid(alpha=0.2, color='gray')
+
+# 圖2：配置比例
+ax2 = axes[1]
+total     = eq_lev['value']
+stock_pct = eq_lev['stock_value'] / total * 100
+cash_pct  = eq_lev['cash'] / total * 100
+ax2.stackplot(eq_lev.index, stock_pct, cash_pct,
+              labels=['股票%', '現金%'], colors=['#e74c3c', '#7f8c8d'], alpha=0.8)
+ax2.axhline(stock_ratio*100, color='white', lw=1, ls='--', alpha=0.7)
+ax2.set_ylim(0, 100)
+ax2.set_ylabel('配置比例（%）')
+ax2.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white', loc='upper right')
+ax2.grid(alpha=0.2, color='gray')
+
+# 圖3：超額報酬
+ax3 = axes[2]
+bm_aligned = eq_bm['value'].reindex(eq_lev.index)
+relative   = (eq_lev['value'].values / bm_aligned.values - 1) * 100
+ax3.plot(eq_lev.index, relative, color='#9b59b6', lw=1.5)
+ax3.axhline(0, color='gray', lw=0.8, ls='--')
+ax3.fill_between(eq_lev.index, 0, relative,
+                 where=np.array(relative) >= 0, alpha=0.3, color='#2ecc71', label='領先0050')
+ax3.fill_between(eq_lev.index, 0, relative,
+                 where=np.array(relative) < 0,  alpha=0.3, color='#e74c3c', label='落後0050')
+ax3.set_ylabel('超額報酬（%）')
+ax3.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white')
+ax3.grid(alpha=0.2, color='gray')
+
+# 圖4：水下曲線
+ax4 = axes[3]
+dd_lev = (eq_lev['value'] / eq_lev['value'].cummax() - 1) * 100
+dd_bm  = (eq_bm['value']  / eq_bm['value'].cummax()  - 1) * 100
+ax4.plot(eq_lev.index, dd_lev, label='槓桿策略', color='#e74c3c', lw=1.5)
+ax4.plot(eq_bm.index,  dd_bm,  label='0050',     color='#3498db', lw=1.5)
+ax4.fill_between(eq_lev.index, dd_lev, 0, alpha=0.15, color='#e74c3c')
+ax4.fill_between(eq_bm.index,  dd_bm,  0, alpha=0.15, color='#3498db')
+ax4.axhline(0, color='gray', lw=0.8, ls='--')
+
+min_lev_idx = dd_lev.idxmin()
+min_bm_idx  = dd_bm.idxmin()
+ax4.annotate(f"Max {dd_lev.min():.1f}%", xy=(min_lev_idx, dd_lev.min()),
+             xytext=(10, 10), textcoords='offset points',
+             color='#e74c3c', fontsize=8,
+             arrowprops=dict(arrowstyle='->', color='#e74c3c', lw=1))
+ax4.annotate(f"Max {dd_bm.min():.1f}%", xy=(min_bm_idx, dd_bm.min()),
+             xytext=(10, -15), textcoords='offset points',
+             color='#3498db', fontsize=8,
+             arrowprops=dict(arrowstyle='->', color='#3498db', lw=1))
+ax4.set_ylabel('回撤（%）')
+ax4.legend(fontsize=8, facecolor='#1a1a2e', labelcolor='white')
+ax4.grid(alpha=0.2, color='gray')
+
+for ax in axes:
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, color='white')
+
+plt.tight_layout()
+st.pyplot(fig)
+
+# 再平衡明細
+st.divider()
+st.subheader(f'📋 再平衡明細（共 {len(rebalance_df)} 次）')
+if not rebalance_df.empty:
+    st.dataframe(rebalance_df, use_container_width=True)
+else:
+    st.info('回測期間內未觸發再平衡')
+```
+
+else:
+st.info(‘👈 在左側設定參數後，點擊「執行回測」開始’)
+st.markdown(’’’
+**策略說明：**
+- 將資金分成兩部分：一部分買 00631L（0050正2），其餘持有現金
+- 當股票部位偏離目標比例超過設定值時，自動再平衡
+- 再平衡效果：股票漲太多就賣出獲利，跌太多就用現金買進加碼
+- 對照組為同期間買入持有 0050
+
+```
+**再平衡觸發說明：**
+- 設定 50% 表示：股票比例從目標偏移超過 50% 時才再平衡
+- 例如目標 50%，觸發條件為股票比例 > 75% 或 < 25%
+''')
+```
